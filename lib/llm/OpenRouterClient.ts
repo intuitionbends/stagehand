@@ -1,10 +1,17 @@
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-import { LanguageModelV1ToolCallPart } from "@ai-sdk/provider";
+import {
+  LanguageModelV1ToolCallPart,
+  LanguageModelV1Message,
+  LanguageModelV1TextPart,
+  LanguageModelV1ImagePart,
+  LanguageModelV1Prompt,
+  LanguageModelV1ToolChoice,
+} from "@ai-sdk/provider";
 import { ClientOptions } from "openai";
+import { zodToJsonSchema } from "zod-to-json-schema";
 import { LogLine } from "../../types/log";
 import { AvailableModel } from "../../types/model";
 import { LLMCache } from "../cache/LLMCache";
-import { validateZodSchema } from "../utils";
 import {
   CreateChatCompletionOptions,
   LLMClient,
@@ -125,79 +132,170 @@ export class OpenRouterClient extends LLMClient {
     }
 
     try {
+      // Handle system message separately
+      const systemMessage = optionsInitial.messages.find(
+        (msg) => msg.role === "system",
+      );
+      const userMessages = optionsInitial.messages.filter(
+        (msg) => msg.role !== "system",
+      );
+
+      // Format messages according to LanguageModelV1 types
+      const formattedMessages: LanguageModelV1Prompt = userMessages.map(
+        (msg): LanguageModelV1Message => {
+          if (msg.role === "system") {
+            return {
+              role: "system",
+              content:
+                typeof msg.content === "string"
+                  ? msg.content
+                  : msg.content
+                      .map((c) => ("text" in c ? c.text : ""))
+                      .join(""),
+            };
+          } else if (msg.role === "user") {
+            return {
+              role: "user",
+              content:
+                typeof msg.content === "string"
+                  ? [
+                      {
+                        type: "text",
+                        text: msg.content,
+                      } as LanguageModelV1TextPart,
+                    ]
+                  : msg.content.map((content) => {
+                      if ("image_url" in content) {
+                        const imagePart: LanguageModelV1ImagePart = {
+                          type: "image",
+                          image: new URL(content.image_url.url),
+                        };
+                        return imagePart;
+                      }
+                      const textPart: LanguageModelV1TextPart = {
+                        type: "text",
+                        text: content.text,
+                      };
+                      return textPart;
+                    }),
+            };
+          } else {
+            return {
+              role: "assistant",
+              content:
+                typeof msg.content === "string"
+                  ? [
+                      {
+                        type: "text",
+                        text: msg.content,
+                      } as LanguageModelV1TextPart,
+                    ]
+                  : msg.content.map((content) => {
+                      if ("text" in content) {
+                        const textPart: LanguageModelV1TextPart = {
+                          type: "text",
+                          text: content.text,
+                        };
+                        return textPart;
+                      }
+                      if (
+                        "toolCallId" in content &&
+                        "toolName" in content &&
+                        "args" in content
+                      ) {
+                        const toolCallPart: LanguageModelV1ToolCallPart = {
+                          type: "tool-call",
+                          toolCallId: content.toolCallId as string,
+                          toolName: content.toolName as string,
+                          args: content.args,
+                        };
+                        return toolCallPart;
+                      }
+                      return {
+                        type: "text",
+                        text: "",
+                      } as LanguageModelV1TextPart;
+                    }),
+            };
+          }
+        },
+      );
+
+      // Add image if present
+      if (optionsInitial.image) {
+        const imageMessage: LanguageModelV1Message = {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              image: new URL(
+                `data:image/jpeg;base64,${optionsInitial.image.buffer.toString("base64")}`,
+              ),
+            } as LanguageModelV1ImagePart,
+            ...(optionsInitial.image.description
+              ? [
+                  {
+                    type: "text",
+                    text: optionsInitial.image.description,
+                  } as LanguageModelV1TextPart,
+                ]
+              : []),
+          ],
+        };
+        formattedMessages.push(imageMessage);
+      }
+
+      // Handle tools and response model
+      let tools = optionsInitial.tools?.map((tool) => ({
+        type: "function" as const,
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      }));
+
+      // Add response model as a tool if present
+      if (optionsInitial.response_model) {
+        const jsonSchema = zodToJsonSchema(
+          optionsInitial.response_model.schema,
+        );
+        const extractTool = {
+          type: "function" as const,
+          name: "print_extracted_data",
+          description: `Extract data according to the schema: ${optionsInitial.response_model.name}`,
+          parameters: jsonSchema,
+        };
+        tools = tools ? [...tools, extractTool] : [extractTool];
+      }
+
+      const toolChoice: LanguageModelV1ToolChoice =
+        optionsInitial.response_model
+          ? { type: "tool", toolName: "print_extracted_data" }
+          : { type: "auto" };
+
       const model = this.provider(this.modelName);
       const response = await model.doGenerate({
         inputFormat: "messages",
         mode: {
           type: "regular",
-          tools: optionsInitial.tools?.map((tool) => ({
-            type: "function" as const,
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters,
-          })),
+          tools,
+          toolChoice,
         },
-        prompt: optionsInitial.messages.map((msg) => {
-          if (msg.role === "system") {
-            return {
-              role: "system",
-              content: Array.isArray(msg.content)
-                ? msg.content.map((c) => ("text" in c ? c.text : "")).join("")
-                : msg.content,
-            };
-          } else if (msg.role === "user") {
-            return {
-              role: "user",
-              content: Array.isArray(msg.content)
-                ? msg.content.map((c) => {
-                    if ("image_url" in c) {
-                      return {
-                        type: "image",
-                        image: new URL(c.image_url.url),
-                      };
-                    }
-                    return {
-                      type: "text",
-                      text: c.text,
-                    };
-                  })
-                : [{ type: "text", text: msg.content }],
-            };
-          } else {
-            return {
-              role: "assistant",
-              content: Array.isArray(msg.content)
-                ? msg.content.map((c) => {
-                    const part = c as {
-                      type: string;
-                      toolCallId?: string;
-                      toolName?: string;
-                      args?: unknown;
-                      text?: string;
-                    };
-                    if ("text" in part) {
-                      return {
-                        type: "text",
-                        text: part.text || "",
-                      };
-                    }
-                    if (part.toolCallId && part.toolName && part.args) {
-                      return {
-                        type: "tool-call",
-                        toolCallId: part.toolCallId,
-                        toolName: part.toolName,
-                        args: part.args,
-                      } as LanguageModelV1ToolCallPart;
-                    }
-                    return {
-                      type: "text",
-                      text: "",
-                    };
-                  })
-                : [{ type: "text", text: msg.content }],
-            };
-          }
-        }),
+        prompt: [
+          ...(systemMessage
+            ? [
+                {
+                  role: "system" as const,
+                  content:
+                    typeof systemMessage.content === "string"
+                      ? systemMessage.content
+                      : systemMessage.content
+                          .map((c) => ("text" in c ? c.text : ""))
+                          .join(""),
+                },
+              ]
+            : []),
+          ...formattedMessages,
+        ],
         temperature: optionsInitial.temperature,
         topP: optionsInitial.top_p,
         frequencyPenalty: optionsInitial.frequency_penalty,
@@ -251,17 +349,39 @@ export class OpenRouterClient extends LLMClient {
         },
       });
 
-      if (optionsInitial.response_model) {
-        try {
-          const content = llmResponse.choices[0].message.content;
-          if (!content) {
-            throw new Error("No content in response");
-          }
-          const parsedData = JSON.parse(content);
+      // Handle tool calls if present
+      if (llmResponse.choices[0].message.tool_calls?.length) {
+        const toolCall = llmResponse.choices[0].message.tool_calls[0];
+        if (toolCall.function.name === "extract_data") {
+          try {
+            const parsedData = JSON.parse(toolCall.function.arguments);
 
-          if (
-            !validateZodSchema(optionsInitial.response_model.schema, parsedData)
-          ) {
+            if (this.enableCaching) {
+              this.cache.set(
+                cacheOptions,
+                parsedData,
+                optionsInitial.requestId,
+              );
+            }
+
+            return parsedData as T;
+          } catch (error) {
+            logger({
+              category: "openrouter",
+              message: "parse error",
+              level: 0,
+              auxiliary: {
+                error: {
+                  value: error instanceof Error ? error.message : String(error),
+                  type: "string",
+                },
+                toolCall: {
+                  value: JSON.stringify(toolCall),
+                  type: "object",
+                },
+              },
+            });
+
             if (retries > 0) {
               return this.createChatCompletion({
                 options: optionsInitial,
@@ -269,23 +389,8 @@ export class OpenRouterClient extends LLMClient {
                 retries: retries - 1,
               });
             }
-            throw new Error("Invalid response schema");
+            throw error;
           }
-
-          if (this.enableCaching) {
-            this.cache.set(cacheOptions, parsedData, optionsInitial.requestId);
-          }
-
-          return parsedData as T;
-        } catch {
-          if (retries > 0) {
-            return this.createChatCompletion({
-              options: optionsInitial,
-              logger,
-              retries: retries - 1,
-            });
-          }
-          throw new Error("Failed to parse response as JSON");
         }
       }
 
