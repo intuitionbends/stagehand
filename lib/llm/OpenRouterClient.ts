@@ -270,33 +270,71 @@ export class OpenRouterClient extends LLMClient {
 
     if (optionsInitial.response_model) {
       const extractedData = response.choices[0].message.content;
-      const parsedData = JSON.parse(extractedData);
+      try {
+        const parsedData = /^[\{\[]/.test(extractedData.trim())
+          ? JSON.parse(extractedData)
+          : extractedData;
 
-      if (
-        !validateZodSchema(optionsInitial.response_model.schema, parsedData)
-      ) {
-        if (retries > 0) {
-          return this.createChatCompletion({
-            options: optionsInitial,
-            logger,
-            retries: retries - 1,
-          });
+        if (typeof parsedData === "string") {
+          const wrappedData = { content: parsedData };
+          if (
+            !validateZodSchema(
+              optionsInitial.response_model.schema,
+              wrappedData,
+            )
+          ) {
+            if (retries > 0) {
+              return this.createChatCompletion({
+                options: optionsInitial,
+                logger,
+                retries: retries - 1,
+              });
+            }
+            throw new Error("Invalid response schema");
+          }
+          if (this.enableCaching) {
+            this.cache.set(cacheOptions, wrappedData, optionsInitial.requestId);
+          }
+          return wrappedData as T;
         }
 
-        throw new Error("Invalid response schema");
+        // For JSON responses, validate and return as before
+        if (
+          !validateZodSchema(optionsInitial.response_model.schema, parsedData)
+        ) {
+          if (retries > 0) {
+            return this.createChatCompletion({
+              options: optionsInitial,
+              logger,
+              retries: retries - 1,
+            });
+          }
+          throw new Error("Invalid response schema");
+        }
+        if (this.enableCaching) {
+          this.cache.set(cacheOptions, parsedData, optionsInitial.requestId);
+        }
+        return parsedData;
+      } catch (error) {
+        // If JSON parsing fails, wrap the raw content in an object
+        const wrappedData = { content: extractedData };
+        if (
+          !validateZodSchema(optionsInitial.response_model.schema, wrappedData)
+        ) {
+          if (retries > 0) {
+            return this.createChatCompletion({
+              options: optionsInitial,
+              logger,
+              retries: retries - 1,
+            });
+          }
+          throw new Error("Invalid response schema");
+        }
+        if (this.enableCaching) {
+          this.cache.set(cacheOptions, wrappedData, optionsInitial.requestId);
+        }
+        return wrappedData as T;
       }
-
-      if (this.enableCaching) {
-        this.cache.set(
-          cacheOptions,
-          {
-            ...parsedData,
-          },
-          optionsInitial.requestId,
-        );
-      }
-
-      return parsedData;
     }
 
     if (this.enableCaching) {
