@@ -1,6 +1,6 @@
 {
-  "name": "@browserbasehq/stagehand",
-  "version": "1.9.0",
+  "name": "@intuitionbends/stagehand",
+  "version": "1.0.0",
   "description": "An AI web browsing framework focused on simplicity and extensibility.",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -9,6 +9,7 @@
     "2048": "npm run build-dom-scripts && tsx examples/2048.ts",
     "popup": "npm run build-dom-scripts && tsx examples/popup.ts",
     "example": "npm run build-dom-scripts && tsx examples/example.ts",
+    "test:openrouter": "npm run build-dom-scripts && tsx examples/openrouter_test.ts",
     "debug-url": "npm run build-dom-scripts && tsx examples/debugUrl.ts",
     "external-client": "npm run build-dom-scripts && tsx examples/external_client.ts",
     "instructions": "npm run build-dom-scripts && tsx examples/instructions.ts",
@@ -86,10 +87,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/browserbase/stagehand.git"
+    "url": "git+https://github.com/intuitionbends/stagehand.git"
   },
   "bugs": {
-    "url": "https://github.com/browserbase/stagehand/issues"
+    "url": "https://github.com/intuitionbends/stagehand/issues"
   },
-  "homepage": "https://github.com/browserbase/stagehand#readme"
+  "homepage": "https://github.com/intuitionbends/stagehand#readme"
 }
