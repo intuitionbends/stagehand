@@ -1,20 +1,11 @@
-import OpenAI, { ClientOptions } from "openai";
-import { zodResponseFormat } from "openai/helpers/zod";
-import {
-  ChatCompletionAssistantMessageParam,
-  ChatCompletionContentPartImage,
-  ChatCompletionContentPartText,
-  ChatCompletionCreateParamsNonStreaming,
-  ChatCompletionMessageParam,
-  ChatCompletionSystemMessageParam,
-  ChatCompletionUserMessageParam,
-} from "openai/resources/chat";
+import { createOpenRouter } from "@openrouter/ai-sdk-provider";
+import { LanguageModelV1ToolCallPart } from "@ai-sdk/provider";
+import { ClientOptions } from "openai";
 import { LogLine } from "../../types/log";
 import { AvailableModel } from "../../types/model";
 import { LLMCache } from "../cache/LLMCache";
 import { validateZodSchema } from "../utils";
 import {
-  ChatMessage,
   CreateChatCompletionOptions,
   LLMClient,
   LLMResponse,
@@ -22,10 +13,9 @@ import {
 
 export class OpenRouterClient extends LLMClient {
   public type = "openrouter" as const;
-  private client: OpenAI;
+  private provider: ReturnType<typeof createOpenRouter>;
   private cache: LLMCache | undefined;
   private enableCaching: boolean;
-  public clientOptions: ClientOptions;
 
   constructor({
     enableCaching = false,
@@ -37,19 +27,23 @@ export class OpenRouterClient extends LLMClient {
     enableCaching?: boolean;
     cache?: LLMCache;
     modelName: AvailableModel;
-    clientOptions?: ClientOptions;
+    clientOptions?: ClientOptions & {
+      extraBody?: Record<string, unknown>;
+      compatibility?: "strict" | "compatible";
+    };
   }) {
     super(modelName);
-    this.clientOptions = clientOptions;
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
       throw new Error("OPENROUTER_API_KEY environment variable is required");
     }
-    this.client = new OpenAI({
-      baseURL: "https://openrouter.ai/api/v1",
+
+    this.provider = createOpenRouter({
       apiKey,
+      compatibility: "strict",
       ...clientOptions,
     });
+
     this.cache = cache;
     this.enableCaching = enableCaching;
     this.modelName = modelName;
@@ -130,158 +124,143 @@ export class OpenRouterClient extends LLMClient {
       }
     }
 
-    if (optionsInitial.image) {
-      const screenshotMessage: ChatMessage = {
-        role: "user",
-        content: [
-          {
-            type: "image_url",
-            image_url: {
-              url: `data:image/jpeg;base64,${optionsInitial.image.buffer.toString("base64")}`,
-            },
-          },
-          ...(optionsInitial.image.description
-            ? [{ type: "text", text: optionsInitial.image.description }]
-            : []),
-        ],
-      };
-
-      optionsInitial.messages.push(screenshotMessage);
-    }
-
-    let responseFormat = undefined;
-    if (optionsInitial.response_model) {
-      responseFormat = zodResponseFormat(
-        optionsInitial.response_model.schema,
-        optionsInitial.response_model.name,
-      );
-    }
-
-    /* eslint-disable */
-    // Remove unsupported options
-    const { response_model, ...openRouterOptions } = {
-      ...optionsWithoutImageAndRequestId,
-      model: this.modelName,
-    };
-    /* eslint-enable */
-
-    logger({
-      category: "openrouter",
-      message: "creating chat completion",
-      level: 1,
-      auxiliary: {
-        openRouterOptions: {
-          value: JSON.stringify(openRouterOptions),
-          type: "object",
+    try {
+      const model = this.provider(this.modelName);
+      const response = await model.doGenerate({
+        inputFormat: "messages",
+        mode: {
+          type: "regular",
+          tools: optionsInitial.tools?.map((tool) => ({
+            type: "function" as const,
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+          })),
         },
-      },
-    });
-
-    const formattedMessages: ChatCompletionMessageParam[] =
-      optionsInitial.messages.map((message) => {
-        if (Array.isArray(message.content)) {
-          const contentParts = message.content.map((content) => {
-            if ("image_url" in content) {
-              const imageContent: ChatCompletionContentPartImage = {
-                image_url: {
-                  url: content.image_url.url,
-                },
-                type: "image_url",
-              };
-              return imageContent;
-            } else {
-              const textContent: ChatCompletionContentPartText = {
-                text: content.text,
-                type: "text",
-              };
-              return textContent;
-            }
-          });
-
-          if (message.role === "system") {
-            const formattedMessage: ChatCompletionSystemMessageParam = {
-              ...message,
+        prompt: optionsInitial.messages.map((msg) => {
+          if (msg.role === "system") {
+            return {
               role: "system",
-              content: contentParts.filter(
-                (content): content is ChatCompletionContentPartText =>
-                  content.type === "text",
-              ),
+              content: Array.isArray(msg.content)
+                ? msg.content.map((c) => ("text" in c ? c.text : "")).join("")
+                : msg.content,
             };
-            return formattedMessage;
-          } else if (message.role === "user") {
-            const formattedMessage: ChatCompletionUserMessageParam = {
-              ...message,
+          } else if (msg.role === "user") {
+            return {
               role: "user",
-              content: contentParts,
+              content: Array.isArray(msg.content)
+                ? msg.content.map((c) => {
+                    if ("image_url" in c) {
+                      return {
+                        type: "image",
+                        image: new URL(c.image_url.url),
+                      };
+                    }
+                    return {
+                      type: "text",
+                      text: c.text,
+                    };
+                  })
+                : [{ type: "text", text: msg.content }],
             };
-            return formattedMessage;
           } else {
-            const formattedMessage: ChatCompletionAssistantMessageParam = {
-              ...message,
+            return {
               role: "assistant",
-              content: contentParts.filter(
-                (content): content is ChatCompletionContentPartText =>
-                  content.type === "text",
-              ),
+              content: Array.isArray(msg.content)
+                ? msg.content.map((c) => {
+                    const part = c as {
+                      type: string;
+                      toolCallId?: string;
+                      toolName?: string;
+                      args?: unknown;
+                      text?: string;
+                    };
+                    if ("text" in part) {
+                      return {
+                        type: "text",
+                        text: part.text || "",
+                      };
+                    }
+                    if (part.toolCallId && part.toolName && part.args) {
+                      return {
+                        type: "tool-call",
+                        toolCallId: part.toolCallId,
+                        toolName: part.toolName,
+                        args: part.args,
+                      } as LanguageModelV1ToolCallPart;
+                    }
+                    return {
+                      type: "text",
+                      text: "",
+                    };
+                  })
+                : [{ type: "text", text: msg.content }],
             };
-            return formattedMessage;
           }
-        }
-
-        return {
-          role: message.role,
-          content: message.content,
-        };
+        }),
+        temperature: optionsInitial.temperature,
+        topP: optionsInitial.top_p,
+        frequencyPenalty: optionsInitial.frequency_penalty,
+        presencePenalty: optionsInitial.presence_penalty,
       });
 
-    const body: ChatCompletionCreateParamsNonStreaming = {
-      ...openRouterOptions,
-      model: this.modelName,
-      messages: formattedMessages,
-      response_format: responseFormat,
-      stream: false,
-      tools: optionsInitial.tools?.map((tool) => ({
-        function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.parameters,
+      const llmResponse: LLMResponse = {
+        id: "openrouter-" + Date.now(),
+        object: "chat.completion",
+        created: Date.now(),
+        model: this.modelName,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: response.text || null,
+              tool_calls: response.toolCalls?.map((tc) => ({
+                id: tc.toolCallId,
+                type: "function",
+                function: {
+                  name: tc.toolName,
+                  arguments: tc.args,
+                },
+              })),
+            },
+            finish_reason: response.finishReason,
+          },
+        ],
+        usage: {
+          prompt_tokens: response.usage.promptTokens,
+          completion_tokens: response.usage.completionTokens,
+          total_tokens:
+            response.usage.promptTokens + response.usage.completionTokens,
         },
-        type: "function",
-      })),
-    };
+      };
 
-    const response = await this.client.chat.completions.create(body);
-
-    logger({
-      category: "openrouter",
-      message: "response",
-      level: 1,
-      auxiliary: {
-        response: {
-          value: JSON.stringify(response),
-          type: "object",
+      logger({
+        category: "openrouter",
+        message: "response",
+        level: 1,
+        auxiliary: {
+          response: {
+            value: JSON.stringify(llmResponse),
+            type: "object",
+          },
+          requestId: {
+            value: requestId,
+            type: "string",
+          },
         },
-        requestId: {
-          value: requestId,
-          type: "string",
-        },
-      },
-    });
+      });
 
-    if (optionsInitial.response_model) {
-      const extractedData = response.choices[0].message.content;
-      try {
-        const parsedData = /^[\{\[]/.test(extractedData.trim())
-          ? JSON.parse(extractedData)
-          : extractedData;
+      if (optionsInitial.response_model) {
+        try {
+          const content = llmResponse.choices[0].message.content;
+          if (!content) {
+            throw new Error("No content in response");
+          }
+          const parsedData = JSON.parse(content);
 
-        if (typeof parsedData === "string") {
-          const wrappedData = { content: parsedData };
           if (
-            !validateZodSchema(
-              optionsInitial.response_model.schema,
-              wrappedData,
-            )
+            !validateZodSchema(optionsInitial.response_model.schema, parsedData)
           ) {
             if (retries > 0) {
               return this.createChatCompletion({
@@ -292,16 +271,13 @@ export class OpenRouterClient extends LLMClient {
             }
             throw new Error("Invalid response schema");
           }
+
           if (this.enableCaching) {
-            this.cache.set(cacheOptions, wrappedData, optionsInitial.requestId);
+            this.cache.set(cacheOptions, parsedData, optionsInitial.requestId);
           }
-          return wrappedData as T;
-        }
 
-        // For JSON responses, validate and return as before
-        if (
-          !validateZodSchema(optionsInitial.response_model.schema, parsedData)
-        ) {
+          return parsedData as T;
+        } catch {
           if (retries > 0) {
             return this.createChatCompletion({
               options: optionsInitial,
@@ -309,57 +285,37 @@ export class OpenRouterClient extends LLMClient {
               retries: retries - 1,
             });
           }
-          throw new Error("Invalid response schema");
+          throw new Error("Failed to parse response as JSON");
         }
-        if (this.enableCaching) {
-          this.cache.set(cacheOptions, parsedData, optionsInitial.requestId);
-        }
-        return parsedData;
-      } catch (error) {
-        // If JSON parsing fails, wrap the raw content in an object
-        const wrappedData = { content: extractedData };
-        if (
-          !validateZodSchema(optionsInitial.response_model.schema, wrappedData)
-        ) {
-          if (retries > 0) {
-            return this.createChatCompletion({
-              options: optionsInitial,
-              logger,
-              retries: retries - 1,
-            });
-          }
-          throw new Error("Invalid response schema");
-        }
-        if (this.enableCaching) {
-          this.cache.set(cacheOptions, wrappedData, optionsInitial.requestId);
-        }
-        return wrappedData as T;
       }
-    }
 
-    if (this.enableCaching) {
+      if (this.enableCaching) {
+        this.cache.set(cacheOptions, llmResponse, optionsInitial.requestId);
+      }
+
+      return llmResponse as T;
+    } catch (error) {
       logger({
-        category: "llm_cache",
-        message: "caching response",
-        level: 1,
+        category: "openrouter",
+        message: "error",
+        level: 0,
         auxiliary: {
-          requestId: {
-            value: optionsInitial.requestId,
+          error: {
+            value: error.message,
             type: "string",
-          },
-          cacheOptions: {
-            value: JSON.stringify(cacheOptions),
-            type: "object",
-          },
-          response: {
-            value: JSON.stringify(response),
-            type: "object",
           },
         },
       });
-      this.cache.set(cacheOptions, response, optionsInitial.requestId);
-    }
 
-    return response as T;
+      if (retries > 0) {
+        return this.createChatCompletion({
+          options: optionsInitial,
+          logger,
+          retries: retries - 1,
+        });
+      }
+
+      throw error;
+    }
   }
 }
