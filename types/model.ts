@@ -2,20 +2,29 @@ import type { ClientOptions as AnthropicClientOptions } from "@anthropic-ai/sdk"
 import type { ClientOptions as OpenAIClientOptions } from "openai";
 import { z } from "zod";
 
-export const AvailableModelSchema = z.enum([
+export const OpenRouterModelSchema = z
+  .string()
+  .refine((model) => model.includes("/"), {
+    message: "OpenRouter model must be in format: provider/model",
+  });
+
+export const AvailableModelSchema = z.union([
   // OpenAI models
-  "gpt-4o",
-  "gpt-4o-mini",
-  "gpt-4o-2024-08-06",
-  "o1-mini",
-  "o1-preview",
+  z.enum([
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4o-2024-08-06",
+    "o1-mini",
+    "o1-preview",
+  ]),
   // Anthropic models
-  "claude-3-5-sonnet-latest",
-  "claude-3-5-sonnet-20241022",
-  "claude-3-5-sonnet-20240620",
-  // OpenRouter models
-  "anthropic/claude-3.5-sonnet",
-  "anthropic/claude-3.5-sonnet:beta",
+  z.enum([
+    "claude-3-5-sonnet-latest",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-sonnet-20240620",
+  ]),
+  // OpenRouter models - accepts any provider/model format
+  OpenRouterModelSchema,
 ]);
 
 export type AvailableModel = z.infer<typeof AvailableModelSchema>;

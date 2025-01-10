@@ -53,6 +53,7 @@ export interface ChatCompletionOptions {
   tool_choice?: "auto" | "none" | "required";
   maxTokens?: number;
   requestId: string;
+  stream?: boolean;
 }
 
 export type LLMResponse = {
@@ -83,10 +84,38 @@ export type LLMResponse = {
   };
 };
 
+export type LLMStreamResponse = {
+  type: "text" | "tool_call" | "tool_call_delta" | "error" | "done";
+  content?: string;
+  toolCall?: {
+    id: string;
+    type: string;
+    function: {
+      name: string;
+      arguments: string;
+    };
+  };
+  toolCallDelta?: {
+    id: string;
+    type: string;
+    function: {
+      name: string;
+      argumentsDelta: string;
+    };
+  };
+  error?: string;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+};
+
 export interface CreateChatCompletionOptions {
   options: ChatCompletionOptions;
   logger: (message: LogLine) => void;
   retries?: number;
+  onStream?: (response: LLMStreamResponse) => void | Promise<void>;
 }
 
 export abstract class LLMClient {
@@ -105,4 +134,96 @@ export abstract class LLMClient {
   abstract createChatCompletion<T = LLMResponse>(
     options: CreateChatCompletionOptions,
   ): Promise<T>;
+
+  protected async handleStream(
+    stream: AsyncIterable<LLMStreamResponse>,
+    onStream?: (response: LLMStreamResponse) => void | Promise<void>,
+  ): Promise<LLMResponse> {
+    let content = "";
+    const toolCalls: {
+      id: string;
+      type: string;
+      function: {
+        name: string;
+        arguments: string;
+      };
+    }[] = [];
+    let currentToolCall: {
+      id: string;
+      type: string;
+      function: {
+        name: string;
+        arguments: string;
+      };
+    } | null = null;
+    let usage = {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    };
+
+    for await (const chunk of stream) {
+      if (onStream) {
+        await onStream(chunk);
+      }
+
+      switch (chunk.type) {
+        case "text":
+          if (chunk.content) {
+            content += chunk.content;
+          }
+          break;
+        case "tool_call":
+          if (chunk.toolCall) {
+            toolCalls.push(chunk.toolCall);
+          }
+          break;
+        case "tool_call_delta":
+          if (chunk.toolCallDelta) {
+            if (
+              !currentToolCall ||
+              currentToolCall.id !== chunk.toolCallDelta.id
+            ) {
+              currentToolCall = {
+                id: chunk.toolCallDelta.id,
+                type: chunk.toolCallDelta.type,
+                function: {
+                  name: chunk.toolCallDelta.function.name,
+                  arguments: chunk.toolCallDelta.function.argumentsDelta,
+                },
+              };
+              toolCalls.push(currentToolCall);
+            } else {
+              currentToolCall.function.arguments +=
+                chunk.toolCallDelta.function.argumentsDelta;
+            }
+          }
+          break;
+        case "done":
+          if (chunk.usage) {
+            usage = chunk.usage;
+          }
+          break;
+      }
+    }
+
+    return {
+      id: `${this.type}-${Date.now()}`,
+      object: "chat.completion",
+      created: Date.now(),
+      model: this.modelName,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: content || null,
+            tool_calls: toolCalls,
+          },
+          finish_reason: "stop",
+        },
+      ],
+      usage,
+    };
+  }
 }

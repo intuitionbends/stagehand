@@ -11,21 +11,33 @@ import { OpenAIClient } from "./OpenAIClient";
 import { OpenRouterClient } from "./OpenRouterClient";
 
 export class LLMProvider {
-  private modelToProviderMap: { [key in AvailableModel]: ModelProvider } = {
-    // OpenAI models
-    "gpt-4o": "openai",
-    "gpt-4o-mini": "openai",
-    "gpt-4o-2024-08-06": "openai",
-    "o1-mini": "openai",
-    "o1-preview": "openai",
-    // Anthropic models
-    "claude-3-5-sonnet-latest": "anthropic",
-    "claude-3-5-sonnet-20240620": "anthropic",
-    "claude-3-5-sonnet-20241022": "anthropic",
-    // OpenRouter models
-    "anthropic/claude-3.5-sonnet:beta": "openrouter",
-    "anthropic/claude-3.5-sonnet": "openrouter",
-  };
+  private openAIModels = new Set([
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4o-2024-08-06",
+    "o1-mini",
+    "o1-preview",
+  ]);
+
+  private anthropicModels = new Set([
+    "claude-3-5-sonnet-latest",
+    "claude-3-5-sonnet-20240620",
+    "claude-3-5-sonnet-20241022",
+  ]);
+
+  private getProvider(modelName: AvailableModel): ModelProvider {
+    if (this.openAIModels.has(modelName)) {
+      return "openai";
+    }
+    if (this.anthropicModels.has(modelName)) {
+      return "anthropic";
+    }
+    // Any model with a slash is considered an OpenRouter model
+    if (modelName.includes("/")) {
+      return "openrouter";
+    }
+    throw new Error(`Unsupported model: ${modelName}`);
+  }
 
   private logger: (message: LogLine) => void;
   private enableCaching: boolean;
@@ -60,10 +72,7 @@ export class LLMProvider {
     modelName: AvailableModel,
     clientOptions?: ClientOptions,
   ): LLMClient {
-    const provider = this.modelToProviderMap[modelName];
-    if (!provider) {
-      throw new Error(`Unsupported model: ${modelName}`);
-    }
+    const provider = this.getProvider(modelName);
 
     switch (provider) {
       case "openai":

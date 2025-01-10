@@ -6,6 +6,10 @@ import {
   LanguageModelV1ImagePart,
   LanguageModelV1Prompt,
   LanguageModelV1ToolChoice,
+  LanguageModelV1StreamPart,
+  LanguageModelV1FunctionToolCall,
+  LanguageModelV1CallWarning,
+  LanguageModelV1LogProbs,
 } from "@ai-sdk/provider";
 import { ClientOptions } from "openai";
 import { zodToJsonSchema } from "zod-to-json-schema";
@@ -16,6 +20,7 @@ import {
   CreateChatCompletionOptions,
   LLMClient,
   LLMResponse,
+  LLMStreamResponse,
 } from "./LLMClient";
 
 export class OpenRouterClient extends LLMClient {
@@ -60,6 +65,7 @@ export class OpenRouterClient extends LLMClient {
     options: optionsInitial,
     logger,
     retries = 3,
+    onStream,
   }: CreateChatCompletionOptions): Promise<T> {
     const { image, requestId, ...optionsWithoutImageAndRequestId } =
       optionsInitial;
@@ -273,6 +279,43 @@ export class OpenRouterClient extends LLMClient {
           : { type: "auto" };
 
       const model = this.provider(this.modelName);
+
+      if (optionsInitial.stream && onStream) {
+        const { stream } = await model.doStream({
+          inputFormat: "messages",
+          mode: {
+            type: "regular",
+            tools,
+            toolChoice,
+          },
+          prompt: [
+            ...(systemMessage
+              ? [
+                  {
+                    role: "system" as const,
+                    content:
+                      typeof systemMessage.content === "string"
+                        ? systemMessage.content
+                        : systemMessage.content
+                            .map((c) => ("text" in c ? c.text : ""))
+                            .join(""),
+                  },
+                ]
+              : []),
+            ...formattedMessages,
+          ],
+          temperature: optionsInitial.temperature,
+          topP: optionsInitial.top_p,
+          frequencyPenalty: optionsInitial.frequency_penalty,
+          presencePenalty: optionsInitial.presence_penalty,
+        });
+
+        // Convert OpenRouter stream to LLMStreamResponse format
+        const llmStream = this.convertToLLMStream(stream);
+        return this.handleStream(llmStream, onStream) as Promise<T>;
+      }
+
+      // Non-streaming response
       const response = await model.doGenerate({
         inputFormat: "messages",
         mode: {
@@ -302,36 +345,8 @@ export class OpenRouterClient extends LLMClient {
         presencePenalty: optionsInitial.presence_penalty,
       });
 
-      const llmResponse: LLMResponse = {
-        id: "openrouter-" + Date.now(),
-        object: "chat.completion",
-        created: Date.now(),
-        model: this.modelName,
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: "assistant",
-              content: response.text || null,
-              tool_calls: response.toolCalls?.map((tc) => ({
-                id: tc.toolCallId,
-                type: "function",
-                function: {
-                  name: tc.toolName,
-                  arguments: tc.args,
-                },
-              })),
-            },
-            finish_reason: response.finishReason,
-          },
-        ],
-        usage: {
-          prompt_tokens: response.usage.promptTokens,
-          completion_tokens: response.usage.completionTokens,
-          total_tokens:
-            response.usage.promptTokens + response.usage.completionTokens,
-        },
-      };
+      // Convert response to LLMResponse format
+      const llmResponse: LLMResponse = this.convertToLLMResponse(response);
 
       logger({
         category: "openrouter",
@@ -349,55 +364,22 @@ export class OpenRouterClient extends LLMClient {
         },
       });
 
-      // Handle tool calls if present
-      if (llmResponse.choices[0].message.tool_calls?.length) {
-        const toolCall = llmResponse.choices[0].message.tool_calls[0];
-        if (toolCall.function.name === "extract_data") {
-          try {
-            const parsedData = JSON.parse(toolCall.function.arguments);
-
-            if (this.enableCaching) {
-              this.cache.set(
-                cacheOptions,
-                parsedData,
-                optionsInitial.requestId,
-              );
-            }
-
-            return parsedData as T;
-          } catch (error) {
-            logger({
-              category: "openrouter",
-              message: "parse error",
-              level: 0,
-              auxiliary: {
-                error: {
-                  value: error instanceof Error ? error.message : String(error),
-                  type: "string",
-                },
-                toolCall: {
-                  value: JSON.stringify(toolCall),
-                  type: "object",
-                },
-              },
-            });
-
-            if (retries > 0) {
-              return this.createChatCompletion({
-                options: optionsInitial,
-                logger,
-                retries: retries - 1,
-              });
-            }
-            throw error;
-          }
-        }
+      // Handle response model and tool calls
+      const result = await this.handleToolCalls(
+        llmResponse,
+        optionsInitial,
+        cacheOptions,
+        logger,
+        retries,
+      );
+      if (result) {
+        return result as T;
       }
 
+      // Cache and return response
       if (this.enableCaching) {
         this.cache.set(cacheOptions, llmResponse, optionsInitial.requestId);
       }
-
       return llmResponse as T;
     } catch (error) {
       logger({
@@ -417,10 +399,155 @@ export class OpenRouterClient extends LLMClient {
           options: optionsInitial,
           logger,
           retries: retries - 1,
+          onStream,
         });
       }
 
       throw error;
     }
+  }
+
+  private async *convertToLLMStream(
+    stream: ReadableStream<LanguageModelV1StreamPart>,
+  ): AsyncGenerator<LLMStreamResponse> {
+    const reader = stream.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        if (value.type === "text-delta") {
+          yield {
+            type: "text",
+            content: value.textDelta,
+          };
+        } else if (
+          value.type === "tool-call" ||
+          value.type === "tool-call-delta"
+        ) {
+          yield {
+            type: "tool_call",
+            toolCall: {
+              id: value.toolCallId,
+              type: "function",
+              function: {
+                name:
+                  value.type === "tool-call" ? value.toolName : value.toolName,
+                arguments:
+                  value.type === "tool-call" ? value.args : value.argsTextDelta,
+              },
+            },
+          };
+        } else if (value.type === "finish") {
+          yield {
+            type: "done",
+            usage: {
+              prompt_tokens: value.usage.promptTokens,
+              completion_tokens: value.usage.completionTokens,
+              total_tokens:
+                value.usage.promptTokens + value.usage.completionTokens,
+            },
+          };
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  private convertToLLMResponse(response: {
+    text?: string;
+    toolCalls?: LanguageModelV1FunctionToolCall[];
+    finishReason: string;
+    usage: {
+      promptTokens: number;
+      completionTokens: number;
+    };
+    rawCall?: Record<string, unknown>;
+    rawResponse?: Record<string, unknown>;
+    warnings?: LanguageModelV1CallWarning[];
+    logprobs?: LanguageModelV1LogProbs;
+  }): LLMResponse {
+    return {
+      id: "openrouter-" + Date.now(),
+      object: "chat.completion",
+      created: Date.now(),
+      model: this.modelName,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: response.text || null,
+            tool_calls: response.toolCalls?.map(
+              (tc: LanguageModelV1FunctionToolCall) => ({
+                id: tc.toolCallId,
+                type: "function",
+                function: {
+                  name: tc.toolName,
+                  arguments: tc.args,
+                },
+              }),
+            ),
+          },
+          finish_reason: response.finishReason,
+        },
+      ],
+      usage: {
+        prompt_tokens: response.usage.promptTokens,
+        completion_tokens: response.usage.completionTokens,
+        total_tokens:
+          response.usage.promptTokens + response.usage.completionTokens,
+      },
+    };
+  }
+
+  private async handleToolCalls(
+    llmResponse: LLMResponse,
+    options: CreateChatCompletionOptions["options"],
+    cacheOptions: Record<string, unknown>,
+    logger: (message: LogLine) => void,
+    retries: number,
+  ): Promise<unknown | null> {
+    if (llmResponse.choices[0].message.tool_calls?.length) {
+      const toolCall = llmResponse.choices[0].message.tool_calls[0];
+      if (toolCall.function.name === "extract_data") {
+        try {
+          const parsedData = JSON.parse(toolCall.function.arguments);
+
+          if (this.enableCaching) {
+            this.cache.set(cacheOptions, parsedData, options.requestId);
+          }
+
+          return parsedData;
+        } catch (error) {
+          logger({
+            category: "openrouter",
+            message: "parse error",
+            level: 0,
+            auxiliary: {
+              error: {
+                value: error instanceof Error ? error.message : String(error),
+                type: "string",
+              },
+              toolCall: {
+                value: JSON.stringify(toolCall),
+                type: "object",
+              },
+            },
+          });
+
+          if (retries > 0) {
+            return this.createChatCompletion({
+              options,
+              logger,
+              retries: retries - 1,
+            });
+          }
+          throw error;
+        }
+      }
+    }
+    return null;
   }
 }
