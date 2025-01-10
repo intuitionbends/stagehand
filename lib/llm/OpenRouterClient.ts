@@ -9,13 +9,11 @@ import {
   ChatCompletionSystemMessageParam,
   ChatCompletionUserMessageParam,
 } from "openai/resources/chat";
-import zodToJsonSchema from "zod-to-json-schema";
 import { LogLine } from "../../types/log";
 import { AvailableModel } from "../../types/model";
 import { LLMCache } from "../cache/LLMCache";
 import { validateZodSchema } from "../utils";
 import {
-  ChatCompletionOptions,
   ChatMessage,
   CreateChatCompletionOptions,
   LLMClient,
