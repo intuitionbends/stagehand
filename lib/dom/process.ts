@@ -59,7 +59,7 @@ export async function processAllOfDom() {
 }
 
 export async function scrollToHeight(height: number) {
-  window.scrollTo({ top: height, left: 0, behavior: "smooth" });
+  window.scrollTo({ top: height, left: 0, behavior: "instant" });
 
   // Wait for scrolling to finish using the scrollend event
   await new Promise<void>((resolve) => {

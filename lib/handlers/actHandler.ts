@@ -233,7 +233,19 @@ export class StagehandActHandler {
       try {
         await locator
           .evaluate((element: HTMLElement) => {
-            element.scrollIntoView({ behavior: "smooth", block: "center" });
+            // Only scroll if element is not already in viewport
+            const rect = element.getBoundingClientRect();
+            const isInViewport =
+              rect.top >= 0 &&
+              rect.left >= 0 &&
+              rect.bottom <=
+                (window.innerHeight || document.documentElement.clientHeight) &&
+              rect.right <=
+                (window.innerWidth || document.documentElement.clientWidth);
+
+            if (!isInViewport) {
+              element.scrollIntoView({ behavior: "instant", block: "nearest" });
+            }
           })
           .catch((e: Error) => {
             this.logger({
