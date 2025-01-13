@@ -88,116 +88,182 @@ export async function processElements(
   selectorMap: Record<number, string[]>;
 }> {
   console.time("processElements:total");
+
+  // Pre-calculate viewport dimensions
   const viewportHeight = calculateViewportHeight();
-  const chunkHeight = viewportHeight * chunk;
+  const documentHeight = document.documentElement.scrollHeight;
+  const maxScrollTop = documentHeight - viewportHeight;
+  const offsetTop = Math.min(viewportHeight * chunk, maxScrollTop);
 
-  // Calculate the maximum scrollable offset
-  const maxScrollTop = document.documentElement.scrollHeight - viewportHeight;
-
-  // Adjust the offsetTop to not exceed the maximum scrollable offset
-  const offsetTop = Math.min(chunkHeight, maxScrollTop);
-
+  // Scroll if needed (with optimized scroll handling)
   if (scrollToChunk) {
     console.time("processElements:scroll");
     await scrollToHeight(offsetTop);
     console.timeEnd("processElements:scroll");
   }
 
-  const candidateElements: Array<ChildNode> = [];
-  const DOMQueue: Array<ChildNode> = [...document.body.childNodes];
+  // Use a more efficient tree walker for DOM traversal
+  const treeWalker = document.createTreeWalker(
+    document.body,
+    NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
+    {
+      acceptNode: (node: Node) => {
+        // Quick rejection for non-visible or inactive elements
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          const element = node as Element;
+          if (
+            element.hasAttribute("hidden") ||
+            element.hasAttribute("disabled") ||
+            element.getAttribute("aria-disabled") === "true" ||
+            getComputedStyle(element).display === "none" ||
+            getComputedStyle(element).visibility === "hidden"
+          ) {
+            return NodeFilter.FILTER_REJECT;
+          }
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    },
+  );
 
   console.log("Stagehand (Browser Process): Generating candidate elements");
   console.time("processElements:findCandidates");
 
-  while (DOMQueue.length > 0) {
-    const element = DOMQueue.pop();
+  const candidateElements: Array<Element | Text> = [];
+  const visibilityCache = new WeakMap<Element, boolean>();
+  const styleCache = new WeakMap<Element, CSSStyleDeclaration>();
 
-    let shouldAddElement = false;
+  // Batch DOM reads for performance
+  let currentNode: Node | null;
+  while ((currentNode = treeWalker.nextNode())) {
+    let shouldAdd = false;
 
-    if (element && isElementNode(element)) {
-      const childrenCount = element.childNodes.length;
+    if (currentNode.nodeType === Node.ELEMENT_NODE) {
+      const element = currentNode as Element;
 
-      // Always traverse child nodes
-      for (let i = childrenCount - 1; i >= 0; i--) {
-        const child = element.childNodes[i];
-        DOMQueue.push(child as ChildNode);
+      // Cache computed styles
+      let computedStyle = styleCache.get(element);
+      if (!computedStyle) {
+        computedStyle = getComputedStyle(element);
+        styleCache.set(element, computedStyle);
       }
 
-      // Check if element is interactive
-      if (isInteractiveElement(element)) {
-        if (isActive(element) && isVisible(element)) {
-          shouldAddElement = true;
+      // Quick visibility check using cached styles
+      if (
+        computedStyle.display === "none" ||
+        computedStyle.visibility === "hidden" ||
+        computedStyle.opacity === "0"
+      ) {
+        continue;
+      }
+
+      // Cache visibility check results
+      let isElementVisible = visibilityCache.get(element);
+      if (isElementVisible === undefined) {
+        const rect = element.getBoundingClientRect();
+        isElementVisible =
+          rect.width > 0 &&
+          rect.height > 0 &&
+          rect.top >= -rect.height &&
+          rect.bottom <= window.innerHeight + rect.height;
+        visibilityCache.set(element, isElementVisible);
+      }
+
+      if (isElementVisible && isActive(element)) {
+        if (isInteractiveElement(element) || isLeafElement(element)) {
+          shouldAdd = true;
         }
       }
+    } else if (currentNode.nodeType === Node.TEXT_NODE) {
+      const textNode = currentNode as Text;
+      if (textNode.textContent?.trim()) {
+        const parent = textNode.parentElement;
+        if (parent) {
+          let isParentVisible = visibilityCache.get(parent);
+          if (isParentVisible === undefined) {
+            const computedStyle = getComputedStyle(parent);
+            styleCache.set(parent, computedStyle);
 
-      if (isLeafElement(element)) {
-        if (isActive(element) && isVisible(element)) {
-          shouldAddElement = true;
+            if (
+              computedStyle.display === "none" ||
+              computedStyle.visibility === "hidden" ||
+              computedStyle.opacity === "0"
+            ) {
+              continue;
+            }
+
+            const rect = parent.getBoundingClientRect();
+            isParentVisible =
+              rect.width > 0 &&
+              rect.height > 0 &&
+              rect.top >= -rect.height &&
+              rect.bottom <= window.innerHeight + rect.height;
+            visibilityCache.set(parent, isParentVisible);
+          }
+          shouldAdd = isParentVisible;
         }
       }
     }
 
-    if (element && isTextNode(element) && isTextVisible(element)) {
-      shouldAddElement = true;
-    }
-
-    if (shouldAddElement) {
-      candidateElements.push(element);
+    if (shouldAdd) {
+      candidateElements.push(currentNode as Element | Text);
     }
   }
 
   console.timeEnd("processElements:findCandidates");
 
-  const selectorMap: Record<number, string[]> = {};
-  let outputString = "";
-
-  console.log(
-    `Stagehand (Browser Process): Processing candidate elements: ${candidateElements.length}`,
-  );
-
+  // Process candidates in parallel where possible
   console.time("processElements:processCandidates");
-  console.time("processElements:generateXPaths");
-  const xpathLists = await Promise.all(
-    candidateElements.map(async (element) => {
-      if (xpathCache.has(element)) {
-        return xpathCache.get(element);
-      }
 
-      const xpaths = await generateXPaths(element);
+  // Prepare data structures
+  const selectorMap: Record<number, string[]> = {};
+  const outputParts: string[] = new Array(candidateElements.length);
+
+  // Process XPaths in parallel
+  const xpathPromises = candidateElements.map((element, index) => {
+    if (xpathCache.has(element)) {
+      return Promise.resolve({
+        index,
+        xpaths: xpathCache.get(element)!,
+      });
+    }
+    return generateXPaths(element).then((xpaths) => {
       xpathCache.set(element, xpaths);
-      return xpaths;
-    }),
-  );
-  console.timeEnd("processElements:generateXPaths");
+      return { index, xpaths };
+    });
+  });
 
-  candidateElements.forEach((element, index) => {
-    const xpaths = xpathLists[index];
-    let elementOutput = "";
+  // Wait for all XPaths and process elements
+  const results = await Promise.all(xpathPromises);
 
-    if (isTextNode(element)) {
+  results.forEach(({ index, xpaths }) => {
+    const element = candidateElements[index];
+    const actualIndex = index + indexOffset;
+
+    selectorMap[actualIndex] = xpaths;
+
+    if (element.nodeType === Node.TEXT_NODE) {
       const textContent = element.textContent?.trim();
       if (textContent) {
-        elementOutput += `${index + indexOffset}:${textContent}\n`;
+        outputParts[index] = `${actualIndex}:${textContent}\n`;
       }
-    } else if (isElementNode(element)) {
-      const tagName = element.tagName.toLowerCase();
-      const attributes = collectEssentialAttributes(element);
+    } else if (element.nodeType === Node.ELEMENT_NODE) {
+      const el = element as Element;
+      const tagName = el.tagName.toLowerCase();
+      const attributes = collectEssentialAttributes(el);
+      const textContent = el.textContent?.trim() || "";
 
-      const openingTag = `<${tagName}${attributes ? " " + attributes : ""}>`;
-      const closingTag = `</${tagName}>`;
-      const textContent = element.textContent?.trim() || "";
-
-      elementOutput += `${index + indexOffset}:${openingTag}${textContent}${closingTag}\n`;
+      outputParts[index] = `${actualIndex}:<${tagName}${
+        attributes ? " " + attributes : ""
+      }>${textContent}</${tagName}>\n`;
     }
-
-    outputString += elementOutput;
-    selectorMap[index + indexOffset] = xpaths;
   });
-  console.timeEnd("processElements:processCandidates");
 
+  console.timeEnd("processElements:processCandidates");
   console.timeEnd("processElements:total");
+
   return {
-    outputString,
+    outputString: outputParts.join(""),
     selectorMap,
   };
 }
@@ -484,87 +550,6 @@ const interactiveRoles = [
   "tooltip",
 ];
 const interactiveAriaRoles = ["menu", "menuitem", "button"];
-
-/*
- * Checks if an element is visible and therefore relevant for LLMs to consider. We check:
- * - Size
- * - Display properties
- * - Opacity
- * If the element is a child of a previously hidden element, it should not be included, so we don't consider downstream effects of a parent element here
- */
-const isVisible = (element: Element) => {
-  const rect = element.getBoundingClientRect();
-  // Ensure the element is within the viewport
-  if (
-    rect.width === 0 ||
-    rect.height === 0 ||
-    rect.top < 0 ||
-    rect.top > window.innerHeight
-  ) {
-    return false;
-  }
-  if (!isTopElement(element, rect)) {
-    return false;
-  }
-
-  const visible = element.checkVisibility({
-    checkOpacity: true,
-    checkVisibilityCSS: true,
-  });
-
-  return visible;
-};
-
-const isTextVisible = (element: ChildNode) => {
-  const range = document.createRange();
-  range.selectNodeContents(element);
-  const rect = range.getBoundingClientRect();
-
-  if (
-    rect.width === 0 ||
-    rect.height === 0 ||
-    rect.top < 0 ||
-    rect.top > window.innerHeight
-  ) {
-    return false;
-  }
-  const parent = element.parentElement;
-  if (!parent) {
-    return false;
-  }
-  if (!isTopElement(parent, rect)) {
-    return false;
-  }
-
-  const visible = parent.checkVisibility({
-    checkOpacity: true,
-    checkVisibilityCSS: true,
-  });
-
-  return visible;
-};
-
-function isTopElement(elem: ChildNode, rect: DOMRect) {
-  const points = [
-    { x: rect.left + rect.width * 0.25, y: rect.top + rect.height * 0.25 },
-    { x: rect.left + rect.width * 0.75, y: rect.top + rect.height * 0.25 },
-    { x: rect.left + rect.width * 0.25, y: rect.top + rect.height * 0.75 },
-    { x: rect.left + rect.width * 0.75, y: rect.top + rect.height * 0.75 },
-    { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
-  ];
-
-  return points.some((point) => {
-    const topEl = document.elementFromPoint(point.x, point.y);
-    let current = topEl;
-    while (current && current !== document.body) {
-      if (current.isSameNode(elem)) {
-        return true;
-      }
-      current = current.parentElement;
-    }
-    return false;
-  });
-}
 
 const isActive = (element: Element) => {
   if (
