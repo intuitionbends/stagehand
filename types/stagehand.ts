@@ -55,6 +55,18 @@ export interface InitFromPageResult {
   context: BrowserContext;
 }
 
+export interface ActProgressInfo {
+  domContent: string;
+  currentChunk: number;
+  totalChunks: number;
+  extractedText?: string[];
+  currentStep?: string;
+}
+
+export interface ActCallback {
+  onProgress: (info: ActProgressInfo) => Promise<boolean>; // Return true to continue, false to stop
+}
+
 export interface ActOptions {
   action: string;
   modelName?: AvailableModel;
@@ -62,12 +74,14 @@ export interface ActOptions {
   useVision?: "fallback" | boolean;
   variables?: Record<string, string>;
   domSettleTimeoutMs?: number;
+  callback?: ActCallback; // New callback option for AI agent control
 }
 
 export interface ActResult {
   success: boolean;
   message: string;
   action: string;
+  extractedContent?: string[]; // Add extracted content to result
 }
 
 export interface ExtractOptions<T extends z.AnyZodObject> {

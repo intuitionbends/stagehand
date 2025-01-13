@@ -12,6 +12,7 @@ import { StagehandContext } from "../StagehandContext";
 import { StagehandPage } from "../StagehandPage";
 import { generateId } from "../utils";
 import { ScreenshotService } from "../vision";
+import { ActCallback } from "../../types/stagehand";
 
 export class StagehandActHandler {
   private readonly stagehandPage: StagehandPage;
@@ -24,6 +25,34 @@ export class StagehandActHandler {
     [key: string]: { result: string; action: string };
   };
   private readonly userProvidedInstructions?: string;
+  private readonly callback?: ActCallback;
+  private extractedTexts: string[] = [];
+
+  private async _notifyProgress(info: {
+    domContent: string;
+    currentChunk: number;
+    totalChunks: number;
+    currentStep?: string;
+  }): Promise<boolean> {
+    if (!this.callback) return true;
+    return this.callback.onProgress({
+      ...info,
+      extractedText: this.extractedTexts,
+    });
+  }
+
+  private async _extractTextFromDom(domElements: string) {
+    const lines = domElements.split("\n");
+    const texts = lines
+      .map((line) => {
+        const [, content] = line.split(":");
+        return content ? content.trim() : null;
+      })
+      .filter((text) => text) as string[];
+
+    this.extractedTexts.push(...texts);
+    return texts;
+  }
 
   constructor({
     verbose,
@@ -32,6 +61,7 @@ export class StagehandActHandler {
     logger,
     stagehandPage,
     userProvidedInstructions,
+    callback,
   }: {
     verbose: 0 | 1 | 2;
     llmProvider: LLMProvider;
@@ -41,6 +71,7 @@ export class StagehandActHandler {
     stagehandPage: StagehandPage;
     stagehandContext: StagehandContext;
     userProvidedInstructions?: string;
+    callback?: ActCallback;
   }) {
     this.verbose = verbose;
     this.llmProvider = llmProvider;
@@ -50,6 +81,7 @@ export class StagehandActHandler {
     this.actions = {};
     this.stagehandPage = stagehandPage;
     this.userProvidedInstructions = userProvidedInstructions;
+    this.callback = callback;
   }
 
   private async _recordAction(action: string, result: string): Promise<string> {
@@ -908,6 +940,7 @@ export class StagehandActHandler {
             success: true,
             message: "action completed successfully using cached step",
             action,
+            extractedContent: this.extractedTexts,
           };
         }
       }
@@ -974,7 +1007,12 @@ export class StagehandActHandler {
     previousSelectors: string[];
     skipActionCacheForThisStep: boolean;
     domSettleTimeoutMs?: number;
-  }): Promise<{ success: boolean; message: string; action: string }> {
+  }): Promise<{
+    success: boolean;
+    message: string;
+    action: string;
+    extractedContent?: string[];
+  }> {
     try {
       await this.stagehandPage._waitForSettledDom(domSettleTimeoutMs);
       await this.stagehandPage.startDomDebug();
@@ -1064,6 +1102,26 @@ export class StagehandActHandler {
           },
           { chunksSeen },
         );
+
+      // Extract text from current DOM content
+      await this._extractTextFromDom(outputString);
+
+      // Notify progress and check if we should continue
+      const shouldContinue = await this._notifyProgress({
+        domContent: outputString,
+        currentChunk: chunk,
+        totalChunks: chunks.length,
+        currentStep: steps,
+      });
+
+      if (!shouldContinue) {
+        return {
+          success: true,
+          message: "Action terminated early by callback",
+          action,
+          extractedContent: this.extractedTexts,
+        };
+      }
 
       this.logger({
         category: "action",
@@ -1214,6 +1272,7 @@ export class StagehandActHandler {
             success: false,
             message: `Action was not able to be completed.`,
             action: action,
+            extractedContent: this.extractedTexts,
           };
         }
       }
@@ -1424,6 +1483,7 @@ export class StagehandActHandler {
             success: true,
             message: `Action completed successfully: ${steps}${response.step}`,
             action: action,
+            extractedContent: this.extractedTexts,
           };
         }
       } catch (error) {
@@ -1474,6 +1534,7 @@ export class StagehandActHandler {
           success: false,
           message: "error performing action - a",
           action: action,
+          extractedContent: this.extractedTexts,
         };
       }
     } catch (error) {
@@ -1502,6 +1563,7 @@ export class StagehandActHandler {
         success: false,
         message: `Error performing action - C: ${error.message}`,
         action: action,
+        extractedContent: this.extractedTexts,
       };
     }
   }
