@@ -77,6 +77,7 @@ export class StagehandActHandler {
     llmClient: LLMClient;
     domSettleTimeoutMs?: number;
   }): Promise<boolean> {
+    // If action is not marked as completed, no need to verify
     if (!completed) {
       return false;
     }
@@ -96,99 +97,76 @@ export class StagehandActHandler {
       );
     }
 
-    const { selectorMap } = await this.stagehandPage.page.evaluate(() => {
-      return window.processAllOfDom();
+    // Store current scroll position
+    const currentScrollY = await this.stagehandPage.page.evaluate(
+      () => window.scrollY,
+    );
+
+    // Get visible DOM elements without scrolling
+    const { outputString: domElements, selectorMap } =
+      await this.stagehandPage.page.evaluate(() => {
+        return window.processElements(0);
+      });
+
+    let fullpageScreenshot: Buffer | undefined = undefined;
+    if (verifierUseVision) {
+      try {
+        const screenshotService = new ScreenshotService(
+          this.stagehandPage.page,
+          selectorMap,
+          this.verbose,
+          this.logger,
+        );
+        fullpageScreenshot = await screenshotService.getScreenshot(false, 15);
+      } catch (e) {
+        this.logger({
+          category: "action",
+          message:
+            "error getting screenshot, proceeding with DOM-only verification",
+          level: 1,
+          auxiliary: {
+            error: {
+              value: e.message,
+              type: "string",
+            },
+          },
+        });
+      }
+    }
+
+    // Run verification only once
+    const actionCompleted = await verifyActCompletion({
+      goal: action,
+      steps,
+      llmProvider: this.llmProvider,
+      llmClient: verifyLLmClient,
+      screenshot: fullpageScreenshot,
+      domElements,
+      logger: this.logger,
+      requestId,
     });
 
-    let actionCompleted = false;
-    if (completed) {
-      // Run action completion verifier
-      this.logger({
-        category: "action",
-        message: "action marked as completed, verifying if this is true...",
-        level: 1,
-        auxiliary: {
-          action: {
-            value: action,
-            type: "string",
-          },
+    // Restore scroll position
+    await this.stagehandPage.page.evaluate(
+      (y) => window.scrollTo(0, y),
+      currentScrollY,
+    );
+
+    this.logger({
+      category: "action",
+      message: "action completion verification result",
+      level: 1,
+      auxiliary: {
+        action: {
+          value: action,
+          type: "string",
         },
-      });
-
-      let domElements: string | undefined = undefined;
-      let fullpageScreenshot: Buffer | undefined = undefined;
-
-      if (verifierUseVision) {
-        try {
-          const screenshotService = new ScreenshotService(
-            this.stagehandPage.page,
-            selectorMap,
-            this.verbose,
-            this.logger,
-          );
-
-          fullpageScreenshot = await screenshotService.getScreenshot(true, 15);
-        } catch (e) {
-          this.logger({
-            category: "action",
-            message: "error getting full page screenshot. trying again...",
-            level: 1,
-            auxiliary: {
-              error: {
-                value: e.message,
-                type: "string",
-              },
-              trace: {
-                value: e.stack,
-                type: "string",
-              },
-            },
-          });
-
-          const screenshotService = new ScreenshotService(
-            this.stagehandPage.page,
-            selectorMap,
-            this.verbose,
-            this.logger,
-          );
-
-          fullpageScreenshot = await screenshotService.getScreenshot(true, 15);
-        }
-      } else {
-        ({ outputString: domElements } = await this.stagehandPage.page.evaluate(
-          () => {
-            return window.processAllOfDom();
-          },
-        ));
-      }
-
-      actionCompleted = await verifyActCompletion({
-        goal: action,
-        steps,
-        llmProvider: this.llmProvider,
-        llmClient: verifyLLmClient,
-        screenshot: fullpageScreenshot,
-        domElements,
-        logger: this.logger,
-        requestId,
-      });
-
-      this.logger({
-        category: "action",
-        message: "action completion verification result",
-        level: 1,
-        auxiliary: {
-          action: {
-            value: action,
-            type: "string",
-          },
-          result: {
-            value: actionCompleted.toString(),
-            type: "boolean",
-          },
+        result: {
+          value: actionCompleted.toString(),
+          type: "boolean",
         },
-      });
-    }
+      },
+    });
 
     return actionCompleted;
   }

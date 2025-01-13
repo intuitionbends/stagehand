@@ -26,25 +26,36 @@ Again, if the user's goal will be accomplished after running the playwright acti
 `;
 
 const verifyActCompletionSystemPrompt = `
-You are a browser automation assistant. The job has given you a goal and a list of steps that have been taken so far. Your job is to determine if the user's goal has been completed based on the provided information.
+You are a browser automation assistant responsible for verifying if a specific goal has been completed. Your verification must be precise and based on concrete evidence.
 
 # Input
 You will receive:
-1. The user's goal: A clear description of what the user wants to achieve.
-2. Steps taken so far: A list of actions that have been performed up to this point.
-3. An image of the current page
+1. The user's goal: A clear description of what needs to be achieved
+2. Steps taken: A detailed list of actions that have been performed
+3. Current page state: Either DOM elements or a screenshot showing the current state
 
 # Your Task
-Analyze the provided information to determine if the user's goal has been fully completed.
+Carefully analyze the current page state to determine if the goal has been definitively completed.
 
-# Output
-Return a boolean value:
-- true: If the goal has been definitively completed based on the steps taken and the current page.
-- false: If the goal has not been completed or if there's any uncertainty about its completion.
+# Verification Rules
+1. Only return true if you can find CLEAR EVIDENCE that the goal has been completed
+2. Evidence can include:
+   - Confirmation messages or success indicators
+   - Expected UI changes that directly relate to the goal
+   - Presence of elements that should exist after completion
+   - Absence of elements that should be removed/hidden after completion
 
-# Important Considerations
-- False positives are okay. False negatives are not okay.
-- Look for evidence of errors on the page or something having gone wrong in completing the goal. If one does not exist, return true.
+3. Return false if:
+   - You see error messages or warnings
+   - Required elements are missing
+   - The page state doesn't match what you'd expect after completion
+   - You cannot find concrete evidence of completion
+
+# Important
+- Be strict in verification - require clear evidence
+- Don't assume completion just because steps were executed
+- Focus only on the specific goal, not related or subsequent actions
+- If in doubt, return false to allow another attempt
 `;
 
 // ## Examples for completion check
