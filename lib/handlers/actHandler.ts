@@ -140,6 +140,15 @@ export class StagehandActHandler {
         return window.processElements(0);
       });
 
+    // Extract text from verification DOM content and notify progress
+    await this._extractTextFromDom(domElements);
+    await this._notifyProgress({
+      domContent: domElements,
+      currentChunk: 0,
+      totalChunks: 1,
+      currentStep: steps,
+    });
+
     let fullpageScreenshot: Buffer | undefined = undefined;
     if (verifierUseVision) {
       try {
@@ -904,12 +913,22 @@ export class StagehandActHandler {
       );
 
       steps = steps + cachedStep.newStepString;
-      await this.stagehandPage.page.evaluate(
-        ({ chunksSeen }: { chunksSeen: number[] }) => {
-          return window.processDom(chunksSeen);
-        },
-        { chunksSeen },
-      );
+      const { outputString, chunk, chunks } =
+        await this.stagehandPage.page.evaluate(
+          ({ chunksSeen }: { chunksSeen: number[] }) => {
+            return window.processDom(chunksSeen);
+          },
+          { chunksSeen },
+        );
+
+      // Extract text and notify progress for cached action
+      await this._extractTextFromDom(outputString);
+      await this._notifyProgress({
+        domContent: outputString,
+        currentChunk: chunk,
+        totalChunks: chunks.length,
+        currentStep: steps,
+      });
 
       if (cachedStep.completed) {
         // Verify the action was completed successfully
